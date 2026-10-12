@@ -1,0 +1,21 @@
+# Only publish root-level source, tooling, and documentation.
+# Add explicit exceptions if source files move into subdirectories.
+/*
+!/.gitignore
+!/*.c
+!/*.cpp
+!/*.h
+!/*.hpp
+!/Makefile
+!/CMakeLists.txt
+!/*.sh
+!/*.bat
+!/validate_grad_p1
+!/*.md
+!/*.pdf
+!/LICENSE
+!/LICENSE.*
+
+# Exclude macOS metadata even when its suffix matches an exception.
+/._*
+/.DS_Store
