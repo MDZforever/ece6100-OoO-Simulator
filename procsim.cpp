@@ -7,6 +7,7 @@
 #include <inttypes.h>
 
 #include "procsim.hpp"
+#include <deque>
 
 // -------------------------------------------------------------------
 // Internal data structure definitions
@@ -53,10 +54,8 @@ typedef struct {
 static procsim_conf_t current_conf;
 static procsim_stats_t *current_stats;
 
-// Dispatch queue: dynamic array of inst_t pointers
-static inst_t **dispatch_queue = NULL;
-static size_t dispatch_queue_capacity = 0;
-static size_t dispatch_queue_count = 0;
+// Infinite dispatch queue; popping the head must not shift the entire backlog.
+static std::deque<inst_t *> dispatch_queue;
 
 // Scheduling (reservation stations) queue
 static ReservationStation *sched_queue = NULL;
@@ -77,28 +76,53 @@ static int RAT[NUM_REGS];
 static PRFEntry *PRF = NULL;
 static size_t PRF_size = 0; // = NUM_REGS + current_conf.num_pregs
 
-// Free list for physical registers (store indices into PRF)
-static int *free_list = NULL;
-static size_t free_list_count = 0;
+#ifdef DEBUG
+static void print_rat() {
+    for (int i = 0; i < NUM_REGS; ++i)
+        printf("RAT[%d] = %d\n", i, RAT[i]);
+}
+
+static void print_prf() {
+    for (size_t i = 0; i < PRF_size; ++i)
+        printf("PRF[%zu]: free=%d ready=%d\n", i, PRF[i].free, PRF[i].ready);
+}
+
+static void print_rob() {
+    for (size_t i = 0; i < ROB_count; ++i) {
+        const ROBEntry &entry = ROB[(ROB_head + i) % ROB_capacity];
+        printf("ROB[%zu]: instruction=%" PRIu64 " completed=%d\n",
+               i, entry.dyn_count, entry.completed);
+    }
+}
+#endif
 
 // -------------------------------------------------------------------
-// Helper function to push/pop from free list
+// Allocate the lowest available physical register, as required by the model.
 static bool allocate_free_reg(int *preg_out) {
-    if (free_list_count == 0) {
-        return false;
+    for (size_t i = NUM_REGS; i < PRF_size; ++i) {
+        if (PRF[i].free) {
+            PRF[i].free = false;
+            PRF[i].ready = false;
+            *preg_out = (int)i;
+            return true;
+        }
     }
-    // Assign new preg from the back of the free list.
-    *preg_out = free_list[--free_list_count];
-    return true;
+    return false;
 }
 
 static void free_physical_reg(int preg) {
-    // Only free registers that are not architectural (i.e. index >= NUM_REGS)
-    if (preg >= (int)NUM_REGS) {
-        free_list[free_list_count++] = preg;
+    if (preg >= NUM_REGS) {
         PRF[preg].free = true;
         PRF[preg].ready = false;
     }
+}
+
+static void reset_registers() {
+    for (size_t i = 0; i < PRF_size; ++i) {
+        PRF[i].free = i >= NUM_REGS;
+        PRF[i].ready = i < NUM_REGS;
+    }
+    for (int i = 0; i < NUM_REGS; ++i) RAT[i] = i;
 }
 
 // -------------------------------------------------------------------
@@ -125,6 +149,8 @@ static uint64_t stage_state_update(procsim_stats_t *stats,
         // If the instruction is a branch, update branch instruction count.
         if (entry->inst->opcode == opcode_t::OPCODE_BRANCH) {
             stats->num_branch_instructions++;
+            procsim_driver_update_predictor(entry->inst->pc, entry->inst->br_taken,
+                                           entry->inst->dyn_instruction_count);
             // If the branch was mispredicted, update misprediction stats,
             // set the mispredict flag, retire it, and then stop retiring further instructions.
             if (entry->mispredict) {
@@ -134,6 +160,8 @@ static uint64_t stage_state_update(procsim_stats_t *stats,
                 entry->valid = false;
                 ROB_head = (ROB_head + 1) % ROB_capacity;
                 ROB_count--;
+                free(entry->inst);
+                reset_registers();
                 break;
             }
         }
@@ -143,6 +171,7 @@ static uint64_t stage_state_update(procsim_stats_t *stats,
             free_physical_reg(entry->prev_preg);
         }
         
+        free(entry->inst);
         // Remove the ROB entry by marking it invalid and advancing the head.
         entry->valid = false;
         ROB_head = (ROB_head + 1) % ROB_capacity;
@@ -304,59 +333,29 @@ static void stage_dispatch(procsim_stats_t *stats) {
 #ifdef DEBUG
     printf("Stage Dispatch:\n");
 #endif
-    // Separate counters for NOPs and valid (non-NOP) instructions dispatched this cycle.
-    int nop_dispatched = 0;
-    int valid_dispatched = 0;
-
-    // Dispatch until the dispatch queue is empty or until we hit our per-cycle dispatch width limits.
-    while (dispatch_queue_count > 0) {
-        // Check if scheduling queue and ROB have available space.
-        if (sched_queue_count >= sched_queue_capacity || ROB_count >= ROB_capacity) {
+    uint64_t nop_dispatched = 0, valid_dispatched = 0;
+    while (!dispatch_queue.empty()) {
+        if (ROB_count == ROB_capacity) {
             stats->rob_no_dispatch_cycles++;
             break;
         }
-
-        // Check if we have already dispatched enough NOPs and valid instructions for this cycle.
-        if (nop_dispatched >= (int)current_conf.dispatch_width && valid_dispatched >= (int)current_conf.dispatch_width) {
-            break;
-        }
-
-        // Peek at the instruction at the head of the dispatch queue.
-        inst_t *inst = dispatch_queue[0];
-        // Remove the instruction from the dispatch queue by shifting.
-        for (size_t i = 1; i < dispatch_queue_count; i++) {
-            dispatch_queue[i - 1] = dispatch_queue[i];
-        }
-        dispatch_queue_count--;
-
-        // If the instruction is a NOP (assume opcode 0 indicates NOP)
+        if (sched_queue_count == sched_queue_capacity) break;
+        if (nop_dispatched == current_conf.dispatch_width ||
+            valid_dispatched == current_conf.dispatch_width) break;
+        inst_t *inst = dispatch_queue.front();
         if (inst->opcode == 0) {
-            if (nop_dispatched < (int)current_conf.dispatch_width) {
-                nop_dispatched++;
-                free(inst);
-            } else {
-                // Stall further NOP dispatches by reinserting the instruction at the head.
-                dispatch_queue_count++;
-                for (size_t i = dispatch_queue_count - 1; i > 0; i--) {
-                    dispatch_queue[i] = dispatch_queue[i - 1];
-                }
-                dispatch_queue[0] = inst;
-                break;
-            }
+            dispatch_queue.pop_front();
+            free(inst);
+            ++nop_dispatched;
             continue;
         }
-        
-        // For a valid (non-NOP) instruction, enforce dispatch width for valid instructions.
-        if (valid_dispatched >= (int)current_conf.dispatch_width) {
-            // Stall further valid dispatches this cycle: reinsert and exit.
-            dispatch_queue_count++;
-            for (size_t i = dispatch_queue_count - 1; i > 0; i--) {
-                dispatch_queue[i] = dispatch_queue[i - 1];
-            }
-            dispatch_queue[0] = inst;
+        int new_preg = -1;
+        if (inst->dest != -1 && !allocate_free_reg(&new_preg)) {
+            stats->no_dispatch_pregs_cycles++;
             break;
         }
-        valid_dispatched++;
+        dispatch_queue.pop_front();
+        ++valid_dispatched;
 
         // Set up a new reservation station (RS) entry.
         ReservationStation new_rs;
@@ -366,9 +365,6 @@ static void stage_dispatch(procsim_stats_t *stats) {
         if (inst->opcode == opcode_t::OPCODE_ADD || inst->opcode == opcode_t::OPCODE_BRANCH) {
             new_rs.fu_type = 0;
             new_rs.remaining_cycles = 1;
-            if (inst->opcode == opcode_t::OPCODE_BRANCH){
-                stats->num_branch_instructions++;
-            }
         } else if (inst->opcode == opcode_t::OPCODE_MUL) {
             new_rs.fu_type = 1;
             new_rs.remaining_cycles = 3;
@@ -405,21 +401,8 @@ static void stage_dispatch(procsim_stats_t *stats) {
             new_rs.src2_ready = true;
         }
 
-        // If the instruction has a destination, allocate a physical register.
-        int new_preg = -1;
         int old_mapping = -1;
-        if (inst->dest != (int8_t)-1) {
-            if (!allocate_free_reg(&new_preg)) {
-                // Stall dispatch because no free physical register is available.
-                stats->no_dispatch_pregs_cycles++;
-                // Reinsert the instruction back at the head and exit the loop.
-                dispatch_queue_count++;
-                for (size_t i = dispatch_queue_count - 1; i > 0; i--) {
-                    dispatch_queue[i] = dispatch_queue[i - 1];
-                }
-                dispatch_queue[0] = inst;
-                break;
-            }
+        if (inst->dest != -1) {
             old_mapping = RAT[inst->dest];
             RAT[inst->dest] = new_preg;
             PRF[new_preg].free = false;
@@ -453,34 +436,19 @@ static void stage_fetch(procsim_stats_t *stats) {
 #ifdef DEBUG
     printf("Stage Fetch:\n");
 #endif
-    // Fetch up to fetch_width instructions per cycle.
-    for (uint64_t i = 0; i < current_conf.fetch_width; i++) {
+    for (uint64_t i = 0; i < current_conf.fetch_width; ++i) {
         driver_read_status_t drs;
-        const inst_t *fetched_inst = procsim_driver_read_inst(&drs);
-        if (fetched_inst) {
-            // Make a copy of the instruction to store in our dispatch queue.
-            inst_t *inst_copy = (inst_t *)malloc(sizeof(inst_t));
-            memcpy(inst_copy, fetched_inst, sizeof(inst_t));
-            // Append to dispatch queue.
-            if (dispatch_queue_count >= dispatch_queue_capacity) {
-                dispatch_queue_capacity = (dispatch_queue_capacity == 0) ? 16 : dispatch_queue_capacity * 2;
-                dispatch_queue = (inst_t **)realloc(dispatch_queue, dispatch_queue_capacity * sizeof(inst_t *));
-            }
-            dispatch_queue[dispatch_queue_count++] = inst_copy;
-            // Increment fetched instruction count.
+        const inst_t *fetched = procsim_driver_read_inst(&drs);
+        if (fetched) {
+            inst_t *copy = (inst_t *)malloc(sizeof(inst_t));
+            *copy = *fetched;
+            dispatch_queue.push_back(copy);
             stats->instructions_fetched++;
-        } else {
-            // If a cache miss occurred (DRIVER_READ_ICACHE_MISS), insert a NOP.
-            if (drs == driver_read_status_t::DRIVER_READ_ICACHE_MISS) {
-                inst_t *nop = (inst_t *)malloc(sizeof(inst_t));
-                memset(nop, 0, sizeof(inst_t)); // opcode 0 indicates NOP.
-                if (dispatch_queue_count >= dispatch_queue_capacity) {
-                    dispatch_queue_capacity = (dispatch_queue_capacity == 0) ? 16 : dispatch_queue_capacity * 2;
-                    dispatch_queue = (inst_t **)realloc(dispatch_queue, dispatch_queue_capacity * sizeof(inst_t *));
-                }
-                dispatch_queue[dispatch_queue_count++] = nop;
-            }
-            // Otherwise, if end-of-trace, break out.
+        } else if (drs == DRIVER_READ_ICACHE_MISS) {
+            dispatch_queue.push_back((inst_t *)calloc(1, sizeof(inst_t)));
+        } else if (drs == DRIVER_READ_MISPRED) {
+            // Wrong-path NOPs count as fetched but never enter the queue.
+            stats->instructions_fetched++;
         }
     }
 }
@@ -492,11 +460,8 @@ void procsim_init(const procsim_conf_t *sim_conf, procsim_stats_t *stats) {
     current_conf = *sim_conf;
     current_stats = stats;
     
-    // Allocate and initialize dispatch queue.
-    dispatch_queue_capacity = 16;
-    dispatch_queue_count = 0;
-    dispatch_queue = (inst_t **)malloc(dispatch_queue_capacity * sizeof(inst_t *));
-    
+    dispatch_queue.clear();
+
     // Allocate scheduling queue capacity = s * (a + m + l)
     sched_queue_capacity = sim_conf->num_schedq_entries_per_fu * (sim_conf->num_alu_fus + sim_conf->num_mul_fus + sim_conf->num_lsu_fus);
     sched_queue_count = 0;
@@ -521,13 +486,6 @@ void procsim_init(const procsim_conf_t *sim_conf, procsim_stats_t *stats) {
     for (size_t i = NUM_REGS; i < PRF_size; i++) {
         PRF[i].free = true;
         PRF[i].ready = false;
-    }
-    
-    // Allocate free list for physical registers.
-    free_list = (int *)malloc(sim_conf->num_pregs * sizeof(int));
-    free_list_count = 0;
-    for (size_t i = NUM_REGS; i < PRF_size; i++) {
-        free_list[free_list_count++] = i;
     }
     
     // Initialize RAT to identity mapping.
@@ -568,9 +526,9 @@ uint64_t procsim_do_cycle(procsim_stats_t *stats,
     }
     
     // Update max and avg usage stats (simplified update using current counts)
-    if (dispatch_queue_count > stats->dispq_max_usage)
-        stats->dispq_max_usage = dispatch_queue_count;
-    stats->dispq_avg_usage = ((stats->dispq_avg_usage * stats->cycles) + dispatch_queue_count) / (stats->cycles + 1);
+    if (dispatch_queue.size() > stats->dispq_max_usage)
+        stats->dispq_max_usage = dispatch_queue.size();
+    stats->dispq_avg_usage = ((stats->dispq_avg_usage * stats->cycles) + dispatch_queue.size()) / (stats->cycles + 1);
     
     if (sched_queue_count > stats->schedq_max_usage)
         stats->schedq_max_usage = sched_queue_count;
@@ -582,7 +540,7 @@ uint64_t procsim_do_cycle(procsim_stats_t *stats,
     
     stats->cycles++;
 #ifdef DEBUG
-    printf("End-of-cycle dispatch queue usage: %lu\n", dispatch_queue_count);
+    printf("End-of-cycle dispatch queue usage: %lu\n", dispatch_queue.size());
     printf("End-of-cycle sched queue usage: %lu\n", sched_queue_count);
     printf("End-of-cycle ROB usage: %lu\n", ROB_count);
     printf("================================ End cycle %" PRIu64 " ================================\n", stats->cycles);
@@ -601,13 +559,9 @@ void procsim_finish(procsim_stats_t *stats) {
     else
         stats->ipc = 0.0;
 
-    // Free dispatch queue instructions.
-    for (size_t i = 0; i < dispatch_queue_count; i++) {
-        free(dispatch_queue[i]);
-    }
-    free(dispatch_queue);
-    dispatch_queue = NULL;
-    
+    for (inst_t *inst : dispatch_queue) free(inst);
+    dispatch_queue.clear();
+
     // Free scheduling queue.
     free(sched_queue);
     sched_queue = NULL;
@@ -616,10 +570,7 @@ void procsim_finish(procsim_stats_t *stats) {
     free(ROB);
     ROB = NULL;
     
-    // Free physical register file and free list.
+    // Free physical register file.
     free(PRF);
     PRF = NULL;
-    free(free_list);
-    free_list = NULL;
-    
 }
